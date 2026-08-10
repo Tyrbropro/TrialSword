@@ -1,7 +1,7 @@
 --!strict
 --[[
-	Messenger — one-topic MessagingService publish/subscribe with validate + byte-size guard.
-	Never writes DataStore. Never touches ItemService. No MemoryStore.
+	Messenger — one-topic MessagingService for tiny LiveOpsSignal only (≪ 1KiB).
+	Never publishes full Overrides. Never writes DataStore / MemoryStore.
 ]]
 
 local HttpService = game:GetService("HttpService")
@@ -10,23 +10,30 @@ local MessagingService = game:GetService("MessagingService")
 local Types = require(script.Parent.Types)
 local Config = require(script.Parent.Config)
 
-type MessengerPayload = Types.MessengerPayload
+type LiveOpsSignal = Types.LiveOpsSignal
+type LiveOpsDocument = Types.LiveOpsDocument
 type LiveOpsOverrides = Types.LiveOpsOverrides
 type ItemStatsOverride = Types.ItemStatsOverride
 
 export type MessengerResult<T> = { ok: true, value: T } | { ok: false, error: string }
 
--- Publish/Subscribe use a JSON string body so soft-cap checks match the wire bytes we send.
+-- Publish/Subscribe use a JSON string body so soft-cap checks match wire bytes.
 export type MessagingAdapter = {
 	PublishAsync: (topic: string, message: string) -> (),
 	SubscribeAsync: (topic: string, callback: (message: { Data: any }) -> ()) -> RBXScriptConnection,
 }
 
 export type MessengerApi = {
-	validatePayload: (self: MessengerApi, payload: unknown) -> MessengerResult<MessengerPayload>,
-	getEncodedSize: (self: MessengerApi, payload: MessengerPayload) -> number,
-	publish: (self: MessengerApi, payload: MessengerPayload) -> MessengerResult<nil>,
-	subscribe: (self: MessengerApi, onPayload: (MessengerPayload) -> ()) -> MessengerResult<RBXScriptConnection>,
+	validateSignal: (self: MessengerApi, payload: unknown) -> MessengerResult<LiveOpsSignal>,
+	validateDocument: (self: MessengerApi, payload: unknown) -> MessengerResult<LiveOpsDocument>,
+	getEncodedSize: (self: MessengerApi, signal: LiveOpsSignal) -> number,
+	publish: (self: MessengerApi, signal: LiveOpsSignal) -> MessengerResult<nil>,
+	subscribe: (self: MessengerApi, onSignal: (LiveOpsSignal) -> ()) -> MessengerResult<RBXScriptConnection>,
+}
+
+local ALLOWED_SIGNAL_KEYS: { [string]: boolean } = {
+	SchemaVersion = true,
+	Version = true,
 }
 
 local ALLOWED_DOC_KEYS: { [string]: boolean } = {
@@ -102,28 +109,47 @@ local function validateOverrides(overrides: unknown): LiveOpsOverrides?
 	return result
 end
 
-local function validatePayloadValue(payload: unknown): MessengerResult<MessengerPayload>
+local function validateSignalValue(payload: unknown): MessengerResult<LiveOpsSignal>
 	if typeof(payload) ~= "table" then
 		return { ok = false, error = "invalid_payload" }
 	end
-
 	local asTable = payload :: { [any]: any }
-	if not hasOnlyAllowedKeys(asTable, ALLOWED_DOC_KEYS) then
+	if not hasOnlyAllowedKeys(asTable, ALLOWED_SIGNAL_KEYS) then
 		return { ok = false, error = "invalid_payload" }
 	end
-
 	if not isFiniteNumber(asTable.SchemaVersion) then
 		return { ok = false, error = "invalid_payload" }
 	end
 	if not isPositiveInteger(asTable.Version) then
 		return { ok = false, error = "invalid_payload" }
 	end
+	return {
+		ok = true,
+		value = {
+			SchemaVersion = asTable.SchemaVersion :: number,
+			Version = asTable.Version :: number,
+		},
+	}
+end
 
+local function validateDocumentValue(payload: unknown): MessengerResult<LiveOpsDocument>
+	if typeof(payload) ~= "table" then
+		return { ok = false, error = "invalid_payload" }
+	end
+	local asTable = payload :: { [any]: any }
+	if not hasOnlyAllowedKeys(asTable, ALLOWED_DOC_KEYS) then
+		return { ok = false, error = "invalid_payload" }
+	end
+	if not isFiniteNumber(asTable.SchemaVersion) then
+		return { ok = false, error = "invalid_payload" }
+	end
+	if not isPositiveInteger(asTable.Version) then
+		return { ok = false, error = "invalid_payload" }
+	end
 	local overrides = validateOverrides(asTable.Overrides)
 	if overrides == nil then
 		return { ok = false, error = "invalid_payload" }
 	end
-
 	return {
 		ok = true,
 		value = {
@@ -150,17 +176,20 @@ end
 local function createMessenger(adapter: MessagingAdapter): MessengerApi
 	local messenger = {} :: MessengerApi
 
-	function messenger:validatePayload(payload: unknown): MessengerResult<MessengerPayload>
-		return validatePayloadValue(payload)
+	function messenger:validateSignal(payload: unknown): MessengerResult<LiveOpsSignal>
+		return validateSignalValue(payload)
 	end
 
-	function messenger:getEncodedSize(payload: MessengerPayload): number
-		local encoded = HttpService:JSONEncode(payload)
-		return string.len(encoded)
+	function messenger:validateDocument(payload: unknown): MessengerResult<LiveOpsDocument>
+		return validateDocumentValue(payload)
 	end
 
-	function messenger:publish(payload: MessengerPayload): MessengerResult<nil>
-		local validated = validatePayloadValue(payload)
+	function messenger:getEncodedSize(signal: LiveOpsSignal): number
+		return string.len(HttpService:JSONEncode(signal))
+	end
+
+	function messenger:publish(signal: LiveOpsSignal): MessengerResult<nil>
+		local validated = validateSignalValue(signal)
 		if not validated.ok then
 			return { ok = false, error = "invalid_payload" }
 		end
@@ -171,7 +200,7 @@ local function createMessenger(adapter: MessagingAdapter): MessengerApi
 			return { ok = false, error = "payload_too_large" }
 		end
 
-		-- No retry: poll safety net (P4) covers missed fan-out.
+		-- No retry storm; MemoryStore + DS retain truth if publish fails.
 		local ok, err = pcall(function()
 			adapter.PublishAsync(Config.MESSAGING_TOPIC, encoded)
 		end)
@@ -183,16 +212,16 @@ local function createMessenger(adapter: MessagingAdapter): MessengerApi
 		return { ok = true, value = nil }
 	end
 
-	function messenger:subscribe(onPayload: (MessengerPayload) -> ()): MessengerResult<RBXScriptConnection>
+	function messenger:subscribe(onSignal: (LiveOpsSignal) -> ()): MessengerResult<RBXScriptConnection>
 		local ok, connectionOrErr = pcall(function()
 			return adapter.SubscribeAsync(Config.MESSAGING_TOPIC, function(message: { Data: any })
 				local decoded = decodeInboundData(message.Data)
-				local validated = validatePayloadValue(decoded)
+				local validated = validateSignalValue(decoded)
 				if not validated.ok then
 					warn("[Messenger] reject invalid")
 					return
 				end
-				onPayload(validated.value)
+				onSignal(validated.value)
 			end)
 		end)
 
@@ -221,20 +250,24 @@ function Messenger.setAdapterForTests(adapter: MessagingAdapter): ()
 	defaultMessenger = createMessenger(adapter)
 end
 
-function Messenger.validatePayload(payload: unknown): MessengerResult<MessengerPayload>
-	return defaultMessenger:validatePayload(payload)
+function Messenger.validateSignal(payload: unknown): MessengerResult<LiveOpsSignal>
+	return defaultMessenger:validateSignal(payload)
 end
 
-function Messenger.getEncodedSize(payload: MessengerPayload): number
-	return defaultMessenger:getEncodedSize(payload)
+function Messenger.validateDocument(payload: unknown): MessengerResult<LiveOpsDocument>
+	return defaultMessenger:validateDocument(payload)
 end
 
-function Messenger.publish(payload: MessengerPayload): MessengerResult<nil>
-	return defaultMessenger:publish(payload)
+function Messenger.getEncodedSize(signal: LiveOpsSignal): number
+	return defaultMessenger:getEncodedSize(signal)
 end
 
-function Messenger.subscribe(onPayload: (MessengerPayload) -> ()): MessengerResult<RBXScriptConnection>
-	return defaultMessenger:subscribe(onPayload)
+function Messenger.publish(signal: LiveOpsSignal): MessengerResult<nil>
+	return defaultMessenger:publish(signal)
+end
+
+function Messenger.subscribe(onSignal: (LiveOpsSignal) -> ()): MessengerResult<RBXScriptConnection>
+	return defaultMessenger:subscribe(onSignal)
 end
 
 return Messenger

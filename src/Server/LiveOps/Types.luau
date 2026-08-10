@@ -1,6 +1,6 @@
 --!strict
 --[[
-	LiveOps type exports only. No runtime logic, no DataStore/MessagingService.
+	LiveOps type exports only. No runtime logic, no DataStore/MessagingService/MemoryStore.
 ]]
 
 export type ItemId = string -- known ids include "Sword"
@@ -22,9 +22,8 @@ export type ItemDefinition = {
 export type LiveOpsOverrides = { [ItemId]: ItemStatsOverride }
 
 --[[
-	Single-key DataStore document (source of truth).
+	Full document for DataStore + MemoryStore (latest snapshot).
 	SchemaVersion = wire/schema; Version = monotonic content integer.
-	Keep payload-small for MS fan-out (≪ 1KiB).
 ]]
 export type LiveOpsDocument = {
 	SchemaVersion: number,
@@ -34,7 +33,15 @@ export type LiveOpsDocument = {
 
 export type ApplyResult = "Applied" | "RejectedStale" | "RejectedInvalid"
 
--- Same shape as the DS document for one-topic MessagingService fan-out.
-export type MessengerPayload = LiveOpsDocument
+--[[
+	Tiny MessagingService fan-out signal only (≪ 1KiB).
+	Full Overrides never go on the MS wire — followers load from MemoryStore (or DS fallback).
+]]
+export type LiveOpsSignal = {
+	SchemaVersion: number,
+	Version: number,
+}
+
+export type MessengerPayload = LiveOpsSignal
 
 return {}

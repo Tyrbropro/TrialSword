@@ -1,29 +1,30 @@
 --!strict
 --[[
-	LiveOpsService — OnStart load + MS subscribe; single apply path.
-	Followers never write DataStore on apply. Truth then announce via pushOverrides.
-	No fleet-wide DS poll (per-key scale). MS is primary fan-out; DS = OnStart + admin CAS.
+	LiveOpsService — MemoryStore-first start + tiny MS signal + single apply path.
+	DataStore = durable truth (admin CAS). MemoryStore = latest snapshot. MS = version ping.
+	No fleet-wide DataStore poll. Followers never write DS on apply.
 ]]
 
 local Types = require(script.Parent.Types)
 local Config = require(script.Parent.Config)
 local LiveOpsStore = require(script.Parent.LiveOpsStore)
+local LiveOpsCache = require(script.Parent.LiveOpsCache)
 local Messenger = require(script.Parent.Messenger)
 local ItemService = require(script.Parent.Parent.ItemService)
 
 type LiveOpsDocument = Types.LiveOpsDocument
 type LiveOpsOverrides = Types.LiveOpsOverrides
+type LiveOpsSignal = Types.LiveOpsSignal
 type ApplyResult = Types.ApplyResult
 type StoreResult<T> = LiveOpsStore.StoreResult<T>
 
 export type ServiceResult<T> = { ok: true, value: T } | { ok: false, error: string }
 
-local START_GET_RETRY_WAIT_SECONDS = 0.75
-
 local localVersion: number = 0
 local localDocument: LiveOpsDocument? = nil
 local started = false
 local subscribed = false
+local subscribeRetryGeneration = 0
 
 local function copyOverrides(overrides: LiveOpsOverrides): LiveOpsOverrides
 	local copy: LiveOpsOverrides = {}
@@ -44,7 +45,7 @@ local function copyDocument(doc: LiveOpsDocument): LiveOpsDocument
 end
 
 local function applyIncoming(doc: LiveOpsDocument): ApplyResult
-	local validated = Messenger.validatePayload(doc)
+	local validated = Messenger.validateDocument(doc)
 	if not validated.ok then
 		warn("[LiveOps] reject invalid")
 		return "RejectedInvalid"
@@ -56,7 +57,7 @@ local function applyIncoming(doc: LiveOpsDocument): ApplyResult
 		return "RejectedStale"
 	end
 
-	-- Single apply path: update local state + ItemService overlays. Never write DS / publish.
+	-- Single apply path: local state + ItemService overlays. Never write DS / publish.
 	localVersion = clean.Version
 	localDocument = copyDocument(clean)
 	ItemService.setOverrides(clean.Overrides)
@@ -64,11 +65,8 @@ local function applyIncoming(doc: LiveOpsDocument): ApplyResult
 	return "Applied"
 end
 
---[[
-	Read DS once and apply if newer. Used by start, already_started self-heal, pushOverrides,
-	and optional one-shot after subscribe failure. No retries here.
-]]
-local function reconcileFromStore(): StoreResult<LiveOpsDocument?>
+-- ONE DataStore GetAsync → apply if newer (fallback / admin reconcile only).
+local function reconcileFromDataStore(): StoreResult<LiveOpsDocument?>
 	local result = LiveOpsStore.getAsync()
 	if not result.ok then
 		return result
@@ -79,54 +77,99 @@ local function reconcileFromStore(): StoreResult<LiveOpsDocument?>
 	return result
 end
 
-local function loadFromStoreWithOneRetry(): StoreResult<LiveOpsDocument?>
-	local first = LiveOpsStore.getAsync()
-	if first.ok and first.value ~= nil then
-		return first
-	end
-
-	if not first.ok then
-		warn(`[LiveOps] start get failed: {first.error}; retrying once`)
-	else
-		-- Studio often returns ok+nil before DS is ready; one bounded retry then accept empty.
-		warn("[LiveOps] start get empty; retrying once")
-	end
-
-	task.wait(START_GET_RETRY_WAIT_SECONDS)
-	return LiveOpsStore.getAsync()
-end
-
--- One delayed GetAsync only when SubscribeAsync failed — not a fleet poll loop.
-local function scheduleSubscribeFailOneshotReconcile(): ()
-	local delaySeconds = Config.SUBSCRIBE_FAIL_ONESHOT_RECONCILE_SECONDS
-	if delaySeconds <= 0 then
+-- Prefer MemoryStore snapshot; on miss/fail, ONE DS GetAsync.
+local function fetchLatestAndApply(): ()
+	local cacheResult = LiveOpsCache.getAsync()
+	if cacheResult.ok and cacheResult.value ~= nil then
+		applyIncoming(cacheResult.value)
 		return
 	end
-	task.spawn(function()
-		task.wait(delaySeconds)
-		if not started or subscribed then
-			return
-		end
-		local result = reconcileFromStore()
-		if not result.ok then
-			warn(`[LiveOps] subscribe-fail oneshot reconcile failed: {result.error}`)
-		end
-	end)
+	if not cacheResult.ok then
+		warn(`[LiveOps] MemoryStore get failed: {cacheResult.error}; DS fallback once`)
+	end
+	local ds = reconcileFromDataStore()
+	if not ds.ok then
+		warn(`[LiveOps] DataStore fallback get failed: {ds.error}`)
+	end
 end
 
-local function ensureSubscribed(): boolean
-	if subscribed then
-		return true
+local function handleVersionSignal(signal: LiveOpsSignal): ()
+	if signal.Version <= localVersion then
+		return
 	end
-	local subResult = Messenger.subscribe(function(payload)
-		applyIncoming(payload)
-	end)
+	-- Tiny MS ping → load full doc from MemoryStore (or one DS fallback).
+	fetchLatestAndApply()
+end
+
+local function trySubscribeOnce(): boolean
+	local subResult = Messenger.subscribe(handleVersionSignal)
 	if not subResult.ok then
 		warn(`[LiveOps] subscribe failed: {subResult.error}`)
 		return false
 	end
 	subscribed = true
+	print("[LiveOps] subscribed")
 	return true
+end
+
+-- Soft infinite retries with exponential backoff (cap ~60s). Never busy-loop.
+local function startSubscribeWithRetry(): ()
+	if subscribed then
+		return
+	end
+	subscribeRetryGeneration += 1
+	local generation = subscribeRetryGeneration
+
+	task.spawn(function()
+		local delaySeconds = Config.SUBSCRIBE_RETRY_INITIAL_SECONDS
+		if delaySeconds < 1 then
+			delaySeconds = 1
+		end
+		local maxDelay = Config.SUBSCRIBE_RETRY_MAX_SECONDS
+		if maxDelay < delaySeconds then
+			maxDelay = delaySeconds
+		end
+
+		while started and generation == subscribeRetryGeneration and not subscribed do
+			if trySubscribeOnce() then
+				return
+			end
+			task.wait(delaySeconds)
+			delaySeconds = math.min(delaySeconds * 2, maxDelay)
+		end
+	end)
+end
+
+local function loadOnStart(): ()
+	-- PRIMARY: MemoryStore. DS only if cache miss/fail (not mass GetAsync("Current")).
+	local cacheResult = LiveOpsCache.getAsync()
+	if cacheResult.ok and cacheResult.value ~= nil then
+		applyIncoming(cacheResult.value)
+		return
+	end
+
+	if not cacheResult.ok then
+		warn(`[LiveOps] start MemoryStore miss/fail: {cacheResult.error}`)
+	else
+		print("[LiveOps] start: MemoryStore empty; one DataStore fallback")
+	end
+
+	local ds = LiveOpsStore.getAsync()
+	if not ds.ok then
+		warn(`[LiveOps] start DS fallback failed: {ds.error}; localVersion=0`)
+		localVersion = 0
+		localDocument = nil
+		ItemService.clearOverrides()
+		return
+	end
+	if ds.value == nil then
+		print("[LiveOps] start: DataStore empty; localVersion=0 (base stats)")
+		localVersion = 0
+		localDocument = nil
+		ItemService.clearOverrides()
+		return
+	end
+	applyIncoming(ds.value)
 end
 
 local LiveOpsService = {}
@@ -147,57 +190,32 @@ function LiveOpsService.getLocalDocument(): LiveOpsDocument?
 end
 
 function LiveOpsService.start(): ServiceResult<nil>
-	-- Self-heal if main raced / first load missed DS truth. No fleet poll.
 	if started then
-		local healed = reconcileFromStore()
-		if not healed.ok then
-			warn(`[LiveOps] already_started reconcile failed: {healed.error}`)
+		fetchLatestAndApply()
+		if not subscribed then
+			startSubscribeWithRetry()
 		end
 		return { ok = false, error = "already_started" }
 	end
 	started = true
 
-	-- Spread OnStart Gets across servers (per-key budget); then load DS.
 	local startJitterMax = Config.START_LOAD_JITTER_SECONDS_MAX
 	if startJitterMax > 0 then
 		task.wait(math.random() * startJitterMax)
 	end
 
-	-- 1–2. Load from DataStore (one bounded retry on failure); nil → version 0 + empty overlays.
-	local loadResult = loadFromStoreWithOneRetry()
-	if not loadResult.ok then
-		warn(`[LiveOps] start get failed: {loadResult.error}; localVersion=0`)
-		localVersion = 0
-		localDocument = nil
-		ItemService.clearOverrides()
-	elseif loadResult.value == nil then
-		print("[LiveOps] start: DataStore empty; localVersion=0 (base stats)")
-		localVersion = 0
-		localDocument = nil
-		ItemService.clearOverrides()
-	else
-		applyIncoming(loadResult.value)
-	end
-
-	-- 3. Subscribe MS → same applyIncoming. No periodic DS poll.
-	local ok = ensureSubscribed()
-	if not ok then
-		scheduleSubscribeFailOneshotReconcile()
-	end
+	loadOnStart()
+	startSubscribeWithRetry()
 
 	return { ok = true, value = nil }
 end
 
 --[[
-	Admin seam (P5): reconcile local from DS → CAS write → publish → local apply.
-	No retry storms; publish failure: peers still get MS from originator; new servers OnStart.
+	Admin: CAS DS → MemoryStore set → tiny MS signal → local apply.
 ]]
 function LiveOpsService.pushOverrides(overrides: LiveOpsOverrides): StoreResult<LiveOpsDocument>
-	local reconcile = reconcileFromStore()
-	if not reconcile.ok then
-		warn(`[LiveOps] pushOverrides reconcile get failed: {reconcile.error}`)
-		return { ok = false, error = reconcile.error }
-	end
+	-- Rare admin-server reconcile (MemoryStore first, else one DS get).
+	fetchLatestAndApply()
 
 	local nextDoc: LiveOpsDocument = {
 		SchemaVersion = Config.SCHEMA_VERSION,
@@ -211,7 +229,17 @@ function LiveOpsService.pushOverrides(overrides: LiveOpsOverrides): StoreResult<
 	end
 
 	local committed = cas.value
-	local published = Messenger.publish(committed)
+
+	local cached = LiveOpsCache.setAsync(committed)
+	if not cached.ok then
+		warn(`[LiveOps] MemoryStore write failed after CAS: {cached.error}`)
+	end
+
+	local signal: LiveOpsSignal = {
+		SchemaVersion = committed.SchemaVersion,
+		Version = committed.Version,
+	}
+	local published = Messenger.publish(signal)
 	if not published.ok then
 		warn(`[LiveOps] publish failed after CAS: {published.error}`)
 	end

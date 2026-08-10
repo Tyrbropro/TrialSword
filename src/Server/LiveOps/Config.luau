@@ -5,13 +5,13 @@
 	Merge rule (deterministic): effectiveStat = liveOpsOverride ?? baseStat
 
 	Scale target: ~20K CCU, ≥5000 concurrent servers.
-	Propagation ≤ 2 minutes under normal conditions via MessagingService (primary).
-	DataStore poll is a rare backup reconcile only — not the fast path.
+	Propagation ≤ 2 minutes under normal conditions via MessagingService (primary;
+	typically seconds). DataStore is truth for admin CAS + OnStart load only.
 
 	MemoryStore is NOT used.
 	At ≥5000 servers it would add another global budget, failure mode, and
 	consistency edge case. Durable truth (DataStore) + one Publish fan-out
-	(MessagingService) + slow jittered poll already cover durability and reconcile.
+	(MessagingService) cover durability and cross-server apply — no fleet poll.
 
 	Studio Command Bar: prefer ServerScriptService.main.LiveOpsBridge Bindables
 	after Rojo Source sync; re-require of LiveOpsService is unsafe (fresh state).
@@ -32,29 +32,28 @@ local Config = {
 	SCHEMA_VERSION = 1,
 
 	--[[
-		Per-key DataStore throughput (~100 Get RPS on a single key) is the hard
-		limit. Old design: 5000 servers × (1/50s) ≈ 100 Get RPS amortized on
-		"Current" — saturates the key even before aligned spikes.
+		Per-key DataStore Get throughput is ~100 RPS on a single key ("Current").
 
-		New design (MS primary, DS rare backup):
-		- POLL_INTERVAL_SECONDS in [180, 300]; default 240s
-		  5000 / 240 ≈ 20.8 Get RPS amortized; 5000 / 300 ≈ 16.7 Get RPS
-		- Plus POLL_JITTER and MS-recent-apply skip cut actual Gets further
-		- START_LOAD_JITTER spreads OnStart Gets so 5K servers do not align
+		Fleet-wide periodic GetAsync is GONE. Even a slow poll is still O(servers):
+		e.g. 5000 servers / 50s ≈ 100 Get RPS forever; 5000 / 300s ≈ 16.7 RPS forever —
+		still scales with fleet size and competes with OnStart + admin CAS.
 
-		Tradeoff: DS-only convergence can take several minutes if MS is missed;
-		normal patches still propagate in ≤ ~2 minutes via MessagingService.
+		Steady-state DS reads ≈ OnStart only (server join churn), not 5000/interval.
+		Example: if 50 servers start/min → ~0.83 Get RPS on "Current" amortized,
+		well under ~100 RPS. START_LOAD_JITTER spreads boot spikes.
+
+		≤2 min propagation = one admin Publish → MessagingService fan-out (primary).
+		New servers load truth via OnStart GetAsync. Followers never write DS on apply.
 	]]
-	POLL_INTERVAL_SECONDS = 240,
-
-	-- Extra uniform [0, MAX] seconds added each poll cycle (desync servers).
-	POLL_JITTER_SECONDS_MAX = 60,
 
 	-- Uniform [0, MAX] wait before first OnStart GetAsync (desync boot storms).
 	START_LOAD_JITTER_SECONDS_MAX = 30,
 
-	-- Skip poll GetAsync if MessagingService applied a patch within this window.
-	MS_APPLY_SKIP_POLL_SECONDS = 120,
+	--[[
+		If MessagingService SubscribeAsync fails at start: one delayed one-shot
+		GetAsync (not a fleet poll loop). Only scheduled when subscribe fails.
+	]]
+	SUBSCRIBE_FAIL_ONESHOT_RECONCILE_SECONDS = 45,
 
 	--[[
 		MS payloads MUST be ≪ 1KiB. Soft cap 800 bytes leaves headroom under the
@@ -67,7 +66,7 @@ local Config = {
 		One admin Publish after successful CAS fans out to all subscribed servers
 		in one MessagingService delivery wave. At ≥5000 servers that is still one
 		Publish call from the originator (not N publishes). Followers do not write
-		DataStore on apply; they apply locally then rely on rare poll if MS missed.
+		DataStore on apply.
 	]]
 
 	-- Server-only allowlist; P5 Admin auth reads this (not client-replicated).

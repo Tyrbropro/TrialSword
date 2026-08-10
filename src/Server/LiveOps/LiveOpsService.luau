@@ -1,8 +1,8 @@
 --!strict
 --[[
-	LiveOpsService — OnStart load + MS subscribe + slow jittered poll; single apply path.
+	LiveOpsService — OnStart load + MS subscribe; single apply path.
 	Followers never write DataStore on apply. Truth then announce via pushOverrides.
-	MS is primary fan-out; DS GetAsync on "Current" is rare reconcile (per-key budget).
+	No fleet-wide DS poll (per-key scale). MS is primary fan-out; DS = OnStart + admin CAS.
 ]]
 
 local Types = require(script.Parent.Types)
@@ -19,16 +19,11 @@ type StoreResult<T> = LiveOpsStore.StoreResult<T>
 export type ServiceResult<T> = { ok: true, value: T } | { ok: false, error: string }
 
 local START_GET_RETRY_WAIT_SECONDS = 0.75
-local POLL_INTERVAL_MIN = 180
-local POLL_INTERVAL_MAX = 300
 
 local localVersion: number = 0
 local localDocument: LiveOpsDocument? = nil
 local started = false
 local subscribed = false
-local pollToken = 0
--- os.clock() of last successful apply that arrived via MessagingService.
-local lastMsApplyClock: number? = nil
 
 local function copyOverrides(overrides: LiveOpsOverrides): LiveOpsOverrides
 	local copy: LiveOpsOverrides = {}
@@ -70,8 +65,8 @@ local function applyIncoming(doc: LiveOpsDocument): ApplyResult
 end
 
 --[[
-	Read DS once and apply if newer. Used by start, already_started self-heal, pushOverrides.
-	No retries here (callers that need a bounded retry do it explicitly).
+	Read DS once and apply if newer. Used by start, already_started self-heal, pushOverrides,
+	and optional one-shot after subscribe failure. No retries here.
 ]]
 local function reconcileFromStore(): StoreResult<LiveOpsDocument?>
 	local result = LiveOpsStore.getAsync()
@@ -101,69 +96,37 @@ local function loadFromStoreWithOneRetry(): StoreResult<LiveOpsDocument?>
 	return LiveOpsStore.getAsync()
 end
 
-local function shouldSkipPollForRecentMsApply(): boolean
-	local last = lastMsApplyClock
-	if last == nil then
-		return false
-	end
-	return (os.clock() - last) < Config.MS_APPLY_SKIP_POLL_SECONDS
-end
-
-local function pollOnce(): ()
-	if shouldSkipPollForRecentMsApply() then
+-- One delayed GetAsync only when SubscribeAsync failed — not a fleet poll loop.
+local function scheduleSubscribeFailOneshotReconcile(): ()
+	local delaySeconds = Config.SUBSCRIBE_FAIL_ONESHOT_RECONCILE_SECONDS
+	if delaySeconds <= 0 then
 		return
 	end
-	local result = reconcileFromStore()
-	if not result.ok then
-		warn(`[LiveOps] poll get failed: {result.error}`)
-	end
-end
-
-local function resolvePollInterval(): number
-	local interval = Config.POLL_INTERVAL_SECONDS
-	if interval < POLL_INTERVAL_MIN or interval > POLL_INTERVAL_MAX then
-		warn("[LiveOps] POLL_INTERVAL_SECONDS out of [180, 300]; clamping to 240")
-		return 240
-	end
-	return interval
-end
-
-local function startPollLoop(): ()
-	pollToken += 1
-	local token = pollToken
-	local interval = resolvePollInterval()
-	local jitterMax = Config.POLL_JITTER_SECONDS_MAX
-	if jitterMax < 0 then
-		jitterMax = 0
-	end
-
 	task.spawn(function()
-		while started and token == pollToken do
-			local jitter = if jitterMax > 0 then math.random() * jitterMax else 0
-			task.wait(interval + jitter)
-			if not started or token ~= pollToken then
-				break
-			end
-			pollOnce()
+		task.wait(delaySeconds)
+		if not started or subscribed then
+			return
+		end
+		local result = reconcileFromStore()
+		if not result.ok then
+			warn(`[LiveOps] subscribe-fail oneshot reconcile failed: {result.error}`)
 		end
 	end)
 end
 
-local function ensureSubscribed(): ()
+local function ensureSubscribed(): boolean
 	if subscribed then
-		return
+		return true
 	end
 	local subResult = Messenger.subscribe(function(payload)
-		local result = applyIncoming(payload)
-		if result == "Applied" then
-			lastMsApplyClock = os.clock()
-		end
+		applyIncoming(payload)
 	end)
 	if not subResult.ok then
 		warn(`[LiveOps] subscribe failed: {subResult.error}`)
-		return
+		return false
 	end
 	subscribed = true
+	return true
 end
 
 local LiveOpsService = {}
@@ -184,7 +147,7 @@ function LiveOpsService.getLocalDocument(): LiveOpsDocument?
 end
 
 function LiveOpsService.start(): ServiceResult<nil>
-	-- Self-heal if main raced / first load missed DS truth. No second subscribe/poll.
+	-- Self-heal if main raced / first load missed DS truth. No fleet poll.
 	if started then
 		local healed = reconcileFromStore()
 		if not healed.ok then
@@ -203,7 +166,7 @@ function LiveOpsService.start(): ServiceResult<nil>
 	-- 1–2. Load from DataStore (one bounded retry on failure); nil → version 0 + empty overlays.
 	local loadResult = loadFromStoreWithOneRetry()
 	if not loadResult.ok then
-		warn(`[LiveOps] start get failed: {loadResult.error}; localVersion=0 (poll safety net)`)
+		warn(`[LiveOps] start get failed: {loadResult.error}; localVersion=0`)
 		localVersion = 0
 		localDocument = nil
 		ItemService.clearOverrides()
@@ -216,18 +179,18 @@ function LiveOpsService.start(): ServiceResult<nil>
 		applyIncoming(loadResult.value)
 	end
 
-	-- 3. Subscribe MS → same applyIncoming (poll remains rare safety net if this fails).
-	ensureSubscribed()
-
-	-- 4. Slow jittered poll safety net (once).
-	startPollLoop()
+	-- 3. Subscribe MS → same applyIncoming. No periodic DS poll.
+	local ok = ensureSubscribed()
+	if not ok then
+		scheduleSubscribeFailOneshotReconcile()
+	end
 
 	return { ok = true, value = nil }
 end
 
 --[[
 	Admin seam (P5): reconcile local from DS → CAS write → publish → local apply.
-	No retry storms; publish failure still converges via MS peers + rare DS poll.
+	No retry storms; publish failure: peers still get MS from originator; new servers OnStart.
 ]]
 function LiveOpsService.pushOverrides(overrides: LiveOpsOverrides): StoreResult<LiveOpsDocument>
 	local reconcile = reconcileFromStore()

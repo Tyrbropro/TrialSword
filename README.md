@@ -4,12 +4,10 @@ A scalable cross-server system to patch item stats (like Sword base damage) on t
 
 ## Architecture
 
-- **DataStore:** The single source of truth. Uses `UpdateAsync` (CAS) for safe versioning.
-- **MessagingService:** Handles instant cross-server propagation when an admin pushes a patch.
-- **Polling (Fallback):** Servers fetch from DataStore every 45-60s as a safety net. Guarantees a ≤2 min propagation time even if MessagingService drops.
+- **DataStore:** The single source of truth. Uses `UpdateAsync` (CAS) for safe versioning. Only the admin-originating server writes; followers never write on apply.
+- **MessagingService:** Primary cross-server fan-out after a successful admin CAS (≤ ~2 min under normal conditions).
+- **Polling (rare backup):** Slow, jittered DataStore reconcile (minutes, not ~50s). Skips GetAsync if MS applied a patch recently. Protects **per-key** Get throughput on `Current` (~100 RPS limit): e.g. 5000 servers / 240–300s ≈ 17–21 Get RPS amortized vs ~100 RPS at 50s.
 - **No MemoryStore:** Intentionally skipped to avoid budget limits and API failure points at high server counts.
-
-*Note: Live servers only read from the DataStore. Only authorized admins can write to it.*
 
 ## File Structure
 

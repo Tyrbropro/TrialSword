@@ -5,12 +5,13 @@
 	Merge rule (deterministic): effectiveStat = liveOpsOverride ?? baseStat
 
 	Scale target: ~20K CCU, ≥5000 concurrent servers.
-	Propagation: ≤ 2 minutes (MessagingService primary; poll safety net).
+	Propagation ≤ 2 minutes under normal conditions via MessagingService (primary).
+	DataStore poll is a rare backup reconcile only — not the fast path.
 
 	MemoryStore is NOT used.
 	At ≥5000 servers it would add another global budget, failure mode, and
 	consistency edge case. Durable truth (DataStore) + one Publish fan-out
-	(MessagingService) + slow poll already cover durability and reconcile.
+	(MessagingService) + slow jittered poll already cover durability and reconcile.
 
 	Studio Command Bar: prefer ServerScriptService.main.LiveOpsBridge Bindables
 	after Rojo Source sync; re-require of LiveOpsService is unsafe (fresh state).
@@ -31,13 +32,29 @@ local Config = {
 	SCHEMA_VERSION = 1,
 
 	--[[
-		Poll interval MUST stay in [45, 60] s.
-		Worst-case DS GetAsync load at 5000 servers × (1 / 45s) ≈ 111 RPS amortized
-		if every server polls independently; at 60s ≈ 83 RPS. That stays within
-		typical experience DataStore read budgets when readers only poll (no
-		per-player DS, no confirm writes). Prefer 50s as mid-band.
+		Per-key DataStore throughput (~100 Get RPS on a single key) is the hard
+		limit. Old design: 5000 servers × (1/50s) ≈ 100 Get RPS amortized on
+		"Current" — saturates the key even before aligned spikes.
+
+		New design (MS primary, DS rare backup):
+		- POLL_INTERVAL_SECONDS in [180, 300]; default 240s
+		  5000 / 240 ≈ 20.8 Get RPS amortized; 5000 / 300 ≈ 16.7 Get RPS
+		- Plus POLL_JITTER and MS-recent-apply skip cut actual Gets further
+		- START_LOAD_JITTER spreads OnStart Gets so 5K servers do not align
+
+		Tradeoff: DS-only convergence can take several minutes if MS is missed;
+		normal patches still propagate in ≤ ~2 minutes via MessagingService.
 	]]
-	POLL_INTERVAL_SECONDS = 50,
+	POLL_INTERVAL_SECONDS = 240,
+
+	-- Extra uniform [0, MAX] seconds added each poll cycle (desync servers).
+	POLL_JITTER_SECONDS_MAX = 60,
+
+	-- Uniform [0, MAX] wait before first OnStart GetAsync (desync boot storms).
+	START_LOAD_JITTER_SECONDS_MAX = 30,
+
+	-- Skip poll GetAsync if MessagingService applied a patch within this window.
+	MS_APPLY_SKIP_POLL_SECONDS = 120,
 
 	--[[
 		MS payloads MUST be ≪ 1KiB. Soft cap 800 bytes leaves headroom under the
@@ -50,7 +67,7 @@ local Config = {
 		One admin Publish after successful CAS fans out to all subscribed servers
 		in one MessagingService delivery wave. At ≥5000 servers that is still one
 		Publish call from the originator (not N publishes). Followers do not write
-		DataStore on apply; they apply locally then rely on poll if MS was missed.
+		DataStore on apply; they apply locally then rely on rare poll if MS missed.
 	]]
 
 	-- Server-only allowlist; P5 Admin auth reads this (not client-replicated).
